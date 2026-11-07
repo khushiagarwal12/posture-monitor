@@ -31,8 +31,8 @@ POINTS_LOST_PER_BREAK = 3
 # PROVISIONAL: guesses, to be replaced by values taken from recorded data.
 # Hysteresis: it takes a lower value to ENTER "bad" than to get back to "good",
 # so a reading hovering near one line cannot make the state flip back and forth.
-NECK_RATIO_ENTER_BAD = 0.30  # smoothed ratio must fall below this to become bad
-NECK_RATIO_EXIT_BAD = 0.33   # ...and rise above this to become good again
+NECK_RATIO_ENTER_BAD = 0.50  # smoothed ratio must fall below this to become bad
+NECK_RATIO_EXIT_BAD = 0.54   # ...and rise above this to become good again
 SMOOTHING_FRAMES = 15        # rolling-median window (~0.5 s at 30 fps)
 MIN_DWELL_SECONDS = 2.0      # a change must hold this long before it counts
 
