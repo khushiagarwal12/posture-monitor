@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 import time
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -16,8 +17,13 @@ EXIT_OK = 0
 EXIT_SOURCE_ERROR = 3  # camera missing or file unreadable
 EXIT_NO_PERSON = 4     # source worked but nobody was found in frame
 
-# PROVISIONAL: a guess, to be replaced by a value taken from recorded data.
-NECK_RATIO_BAD = 0.30  # below this the head is sunk towards the shoulders
+# PROVISIONAL: guesses, to be replaced by values taken from recorded data.
+# Hysteresis: it takes a lower value to ENTER "bad" than to get back to "good",
+# so a reading hovering near one line cannot make the state flip back and forth.
+NECK_RATIO_ENTER_BAD = 0.30  # smoothed ratio must fall below this to become bad
+NECK_RATIO_EXIT_BAD = 0.33   # ...and rise above this to become good again
+SMOOTHING_FRAMES = 15        # rolling-median window (~0.5 s at 30 fps)
+MIN_DWELL_SECONDS = 2.0      # a change must hold this long before it counts
 
 
 def parse_args():
@@ -75,6 +81,47 @@ def neck_ratio(landmarks, width, height):
     return float(ears_above_shoulders / shoulder_width)
 
 
+class PostureStabiliser:
+    """Turns noisy per-frame ratios into a steady good/bad state.
+
+    Three layers, each fixing a different kind of noise:
+      1. rolling median  - ignores single-frame landmark glitches (outliers)
+      2. hysteresis      - two thresholds, so values near the line do not flicker
+      3. minimum dwell   - the change must persist, so brief movements
+                           (a cough, reaching for water) do not count
+    """
+
+    def __init__(self):
+        self.recent = deque(maxlen=SMOOTHING_FRAMES)
+        self.state = None           # "good" or "bad"; set from the first reading
+        self.change_started = None  # when the ratio first crossed the line
+        self.breaks = 0             # number of confirmed good -> bad changes
+
+    def update(self, ratio, t):
+        self.recent.append(ratio)
+        smoothed = float(np.median(self.recent))
+
+        if self.state is None:  # first reading: start in whatever state it is in
+            self.state = "bad" if smoothed < NECK_RATIO_ENTER_BAD else "good"
+            return smoothed, self.state
+
+        if self.state == "good":
+            crossed = smoothed < NECK_RATIO_ENTER_BAD
+        else:
+            crossed = smoothed > NECK_RATIO_EXIT_BAD
+
+        if not crossed:
+            self.change_started = None  # it came back, so forget the attempt
+        elif self.change_started is None:
+            self.change_started = t
+        elif t - self.change_started >= MIN_DWELL_SECONDS:
+            self.state = "bad" if self.state == "good" else "good"
+            self.change_started = None
+            if self.state == "bad":
+                self.breaks += 1
+        return smoothed, self.state
+
+
 def main():
     args = parse_args()
     cap = open_source(args.source)
@@ -85,8 +132,11 @@ def main():
     is_file = not args.source.isdigit()
     started = time.monotonic()
     frames = 0
-    ratios = []
-    labels = []  # True = good posture, one entry per frame with a person
+    stabiliser = PostureStabiliser()
+    good_frames = 0
+    used_frames = 0
+    raw_breaks = 0  # what a naive per-frame threshold would have counted
+    previous_raw_good = None
     with mp.solutions.pose.Pose(model_complexity=1) as pose:  # 1 = full model, bundled with the package
         while True:
             ok, frame = cap.read()
@@ -99,22 +149,27 @@ def main():
             height, width = frame.shape[:2]
             result = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if result.pose_landmarks:
+                t = frame_time(cap, is_file, started)
                 ratio = neck_ratio(result.pose_landmarks, width, height)
-                ratios.append(ratio)
-                labels.append(ratio >= NECK_RATIO_BAD)
+                _, state = stabiliser.update(ratio, t)
+
+                used_frames += 1
+                good_frames += state == "good"
+                raw_good = ratio >= NECK_RATIO_ENTER_BAD
+                raw_breaks += previous_raw_good is True and not raw_good
+                previous_raw_good = raw_good
     cap.release()
 
-    if not ratios:
+    if used_frames == 0:
         print("error: nobody found in frame", file=sys.stderr)
         return EXIT_NO_PERSON
 
-    # Naive version: every flip of the per-frame label counts as a break.
-    breaks = sum(1 for prev, cur in zip(labels, labels[1:]) if prev and not cur)
     summary = {
         "frames_read": frames,
-        "frames_with_person": len(ratios),
-        "good_fraction": round(sum(labels) / len(labels), 3),
-        "breaks": breaks,
+        "frames_with_person": used_frames,
+        "good_fraction": round(good_frames / used_frames, 3),
+        "breaks": stabiliser.breaks,
+        "raw_breaks_without_stabilising": raw_breaks,  # shows what smoothing removed
     }
     with open(args.out, "w") as f:
         json.dump(summary, f, indent=2)
