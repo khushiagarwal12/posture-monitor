@@ -4,6 +4,7 @@ Reads a video source, tracks the upper body with MediaPipe Pose, classifies
 posture over time and writes a JSON summary of the session.
 """
 import argparse
+import csv
 import json
 import sys
 import time
@@ -44,6 +45,10 @@ def parse_args():
                         help="seconds of video to analyse")
     parser.add_argument("--out", default="posture.json",
                         help="where to write the JSON summary")
+    parser.add_argument("--preview", action="store_true",
+                        help="show a live window (press q to stop); off by default")
+    parser.add_argument("--metrics-csv",
+                        help="also write every reading to this CSV, for choosing thresholds")
     return parser.parse_args()
 
 
@@ -152,6 +157,15 @@ def measure_frame(pose, frame):
         return None  # a corrupt frame is skipped, never fatal
 
 
+def show_preview(frame, smoothed, state):
+    """Draw the current reading on the frame. Returns False if q was pressed."""
+    colour = (0, 200, 0) if state == "good" else (0, 0, 255)
+    cv2.putText(frame, f"{state}  neck_ratio={smoothed:.2f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
+    cv2.imshow("posture", frame)
+    return cv2.waitKey(1) & 0xFF != ord("q")
+
+
 def main():
     args = parse_args()
     cap = open_source(args.source)
@@ -169,6 +183,11 @@ def main():
     raw_breaks = 0  # what a naive per-frame threshold would have counted
     previous_raw_good = None
     last_t = 0.0
+    preview = args.preview
+    csv_file = open(args.metrics_csv, "w", newline="") if args.metrics_csv else None
+    csv_writer = csv.writer(csv_file) if csv_file else None
+    if csv_writer:
+        csv_writer.writerow(["t", "raw_ratio", "smoothed_ratio", "state"])
     with mp.solutions.pose.Pose(model_complexity=1) as pose:  # 1 = full model, bundled with the package
         while True:
             ok, frame = cap.read()
@@ -190,8 +209,18 @@ def main():
             ratio = measure_frame(pose, frame)
             if ratio is None:
                 continue  # no person / low confidence: skip, keep the last state
-            _, state = stabiliser.update(ratio, t)
+            smoothed, state = stabiliser.update(ratio, t)
             last_t = t
+
+            if csv_writer:
+                csv_writer.writerow([round(t, 3), round(ratio, 4), round(smoothed, 4), state])
+            if preview:
+                try:
+                    if not show_preview(frame, smoothed, state):
+                        break
+                except cv2.error:  # e.g. headless OpenCV build: carry on without it
+                    print("warning: preview unavailable, continuing headless", file=sys.stderr)
+                    preview = False
 
             used_frames += 1
             good_frames += state == "good"
@@ -199,6 +228,10 @@ def main():
             raw_breaks += previous_raw_good is True and not raw_good
             previous_raw_good = raw_good
     cap.release()
+    if csv_file:
+        csv_file.close()
+    if args.preview:
+        cv2.destroyAllWindows()
 
     if frames == 0:
         print("error: source opened but no frame could be read", file=sys.stderr)
