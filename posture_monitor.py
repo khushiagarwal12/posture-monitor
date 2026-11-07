@@ -22,6 +22,11 @@ MIN_LANDMARK_VISIBILITY = 0.5   # ignore a pose if ears/shoulders are not clearl
 MIN_USABLE_FRAMES = 30          # fewer measured frames than this is not an observation
 MIN_USABLE_FRACTION = 0.5       # ...nor is a person seen in under half of the frames
 
+# Score = % of time in good posture, minus a flat penalty for each break.
+# The penalty is a judgement call: it makes 5 minutes of 90% good with 1 break
+# score higher than 90% good with 10 breaks.
+POINTS_LOST_PER_BREAK = 3
+
 # PROVISIONAL: guesses, to be replaced by values taken from recorded data.
 # Hysteresis: it takes a lower value to ENTER "bad" than to get back to "good",
 # so a reading hovering near one line cannot make the state flip back and forth.
@@ -163,6 +168,7 @@ def main():
     used_frames = 0
     raw_breaks = 0  # what a naive per-frame threshold would have counted
     previous_raw_good = None
+    last_t = 0.0
     with mp.solutions.pose.Pose(model_complexity=1) as pose:  # 1 = full model, bundled with the package
         while True:
             ok, frame = cap.read()
@@ -185,6 +191,7 @@ def main():
             if ratio is None:
                 continue  # no person / low confidence: skip, keep the last state
             _, state = stabiliser.update(ratio, t)
+            last_t = t
 
             used_frames += 1
             good_frames += state == "good"
@@ -200,11 +207,17 @@ def main():
         print(f"error: person usable in only {used_frames} of {frames} frames", file=sys.stderr)
         return EXIT_NO_PERSON
 
+    good_fraction = good_frames / used_frames
+    minutes = max(last_t, 1) / 60
+    score = 100 * good_fraction - POINTS_LOST_PER_BREAK * stabiliser.breaks
     summary = {
+        "score": round(min(100, max(0, score))),
+        "good_fraction": round(good_fraction, 3),
+        "breaks": stabiliser.breaks,
+        "breaks_per_minute": round(stabiliser.breaks / minutes, 2),
+        "analysed_seconds": round(last_t, 1),
         "frames_read": frames,
         "frames_with_person": used_frames,
-        "good_fraction": round(good_frames / used_frames, 3),
-        "breaks": stabiliser.breaks,
         "raw_breaks_without_stabilising": raw_breaks,  # shows what smoothing removed
     }
     with open(args.out, "w") as f:
