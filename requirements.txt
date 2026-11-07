@@ -1,5 +1,5 @@
-# Pinned: newer MediaPipe releases dropped the bundled mp.solutions.pose model,
-# which this script relies on so it works offline (no model download at runtime).
+# Pinned: newer MediaPipe releases dropped mp.solutions.pose. Version 0.10.21
+# bundles the full pose model (model_complexity=1), so no download at runtime.
 # OpenCV (cv2) is installed automatically as a dependency of mediapipe.
 mediapipe==0.10.21
 numpy<2
