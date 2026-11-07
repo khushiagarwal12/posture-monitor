@@ -15,7 +15,12 @@ import numpy as np
 
 EXIT_OK = 0
 EXIT_SOURCE_ERROR = 3  # camera missing or file unreadable
-EXIT_NO_PERSON = 4     # source worked but nobody was found in frame
+EXIT_NO_PERSON = 4     # source worked but too little usable data (nobody in frame)
+
+MAX_CONSECUTIVE_BAD_READS = 30  # give up on the source after this many failed reads
+MIN_LANDMARK_VISIBILITY = 0.5   # ignore a pose if ears/shoulders are not clearly seen
+MIN_USABLE_FRAMES = 30          # fewer measured frames than this is not an observation
+MIN_USABLE_FRACTION = 0.5       # ...nor is a person seen in under half of the frames
 
 # PROVISIONAL: guesses, to be replaced by values taken from recorded data.
 # Hysteresis: it takes a lower value to ENTER "bad" than to get back to "good",
@@ -69,6 +74,10 @@ def neck_ratio(landmarks, width, height):
     lm = landmarks.landmark
     Pose = mp.solutions.pose.PoseLandmark
 
+    needed = [Pose.LEFT_EAR, Pose.RIGHT_EAR, Pose.LEFT_SHOULDER, Pose.RIGHT_SHOULDER]
+    if min(lm[i].visibility for i in needed) < MIN_LANDMARK_VISIBILITY:
+        return None  # MediaPipe guesses hidden joints; do not trust those guesses
+
     def point(index):
         return np.array([lm[index].x * width, lm[index].y * height])
 
@@ -77,6 +86,8 @@ def neck_ratio(landmarks, width, height):
     shoulder_mid = (left_shoulder + right_shoulder) / 2
 
     shoulder_width = np.linalg.norm(left_shoulder - right_shoulder)
+    if shoulder_width < 1:
+        return None  # degenerate pose, avoids dividing by ~0
     ears_above_shoulders = shoulder_mid[1] - ear_mid[1]  # image y grows downwards
     return float(ears_above_shoulders / shoulder_width)
 
@@ -122,6 +133,20 @@ class PostureStabiliser:
         return smoothed, self.state
 
 
+def measure_frame(pose, frame):
+    """neck_ratio for one frame, or None if the frame is unusable."""
+    if frame is None or frame.size == 0:
+        return None
+    try:
+        height, width = frame.shape[:2]
+        result = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if not result.pose_landmarks:
+            return None
+        return neck_ratio(result.pose_landmarks, width, height)
+    except (cv2.error, ValueError):
+        return None  # a corrupt frame is skipped, never fatal
+
+
 def main():
     args = parse_args()
     cap = open_source(args.source)
@@ -132,6 +157,7 @@ def main():
     is_file = not args.source.isdigit()
     started = time.monotonic()
     frames = 0
+    bad_reads = 0  # consecutive failed reads
     stabiliser = PostureStabiliser()
     good_frames = 0
     used_frames = 0
@@ -141,27 +167,37 @@ def main():
         while True:
             ok, frame = cap.read()
             if not ok:
-                break
-            if frame_time(cap, is_file, started) > args.duration:
+                # A dropped frame: tolerate a few in a row. At the end of a file
+                # the reads keep failing, so this also ends the loop.
+                bad_reads += 1
+                if bad_reads >= MAX_CONSECUTIVE_BAD_READS:
+                    break
+                time.sleep(0.02)
+                continue
+            bad_reads = 0
+
+            t = frame_time(cap, is_file, started)
+            if t > args.duration:
                 break
             frames += 1
 
-            height, width = frame.shape[:2]
-            result = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if result.pose_landmarks:
-                t = frame_time(cap, is_file, started)
-                ratio = neck_ratio(result.pose_landmarks, width, height)
-                _, state = stabiliser.update(ratio, t)
+            ratio = measure_frame(pose, frame)
+            if ratio is None:
+                continue  # no person / low confidence: skip, keep the last state
+            _, state = stabiliser.update(ratio, t)
 
-                used_frames += 1
-                good_frames += state == "good"
-                raw_good = ratio >= NECK_RATIO_ENTER_BAD
-                raw_breaks += previous_raw_good is True and not raw_good
-                previous_raw_good = raw_good
+            used_frames += 1
+            good_frames += state == "good"
+            raw_good = ratio >= NECK_RATIO_ENTER_BAD
+            raw_breaks += previous_raw_good is True and not raw_good
+            previous_raw_good = raw_good
     cap.release()
 
-    if used_frames == 0:
-        print("error: nobody found in frame", file=sys.stderr)
+    if frames == 0:
+        print("error: source opened but no frame could be read", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    if used_frames < MIN_USABLE_FRAMES or used_frames / frames < MIN_USABLE_FRACTION:
+        print(f"error: person usable in only {used_frames} of {frames} frames", file=sys.stderr)
         return EXIT_NO_PERSON
 
     summary = {
