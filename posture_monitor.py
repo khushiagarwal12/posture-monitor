@@ -4,6 +4,7 @@ Reads a video source, tracks the upper body with MediaPipe Pose, classifies
 posture over time and writes a JSON summary of the session.
 """
 import argparse
+import json
 import sys
 import time
 
@@ -13,6 +14,10 @@ import numpy as np
 
 EXIT_OK = 0
 EXIT_SOURCE_ERROR = 3  # camera missing or file unreadable
+EXIT_NO_PERSON = 4     # source worked but nobody was found in frame
+
+# PROVISIONAL: a guess, to be replaced by a value taken from recorded data.
+NECK_RATIO_BAD = 0.30  # below this the head is sunk towards the shoulders
 
 
 def parse_args():
@@ -81,6 +86,7 @@ def main():
     started = time.monotonic()
     frames = 0
     ratios = []
+    labels = []  # True = good posture, one entry per frame with a person
     with mp.solutions.pose.Pose(model_complexity=1) as pose:  # 1 = full model, bundled with the package
         while True:
             ok, frame = cap.read()
@@ -93,12 +99,26 @@ def main():
             height, width = frame.shape[:2]
             result = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if result.pose_landmarks:
-                ratios.append(neck_ratio(result.pose_landmarks, width, height))
+                ratio = neck_ratio(result.pose_landmarks, width, height)
+                ratios.append(ratio)
+                labels.append(ratio >= NECK_RATIO_BAD)
     cap.release()
 
-    print(f"read {frames} frames, person found in {len(ratios)}")
-    if ratios:
-        print(f"neck_ratio min/median/max: {min(ratios):.2f} / {np.median(ratios):.2f} / {max(ratios):.2f}")
+    if not ratios:
+        print("error: nobody found in frame", file=sys.stderr)
+        return EXIT_NO_PERSON
+
+    # Naive version: every flip of the per-frame label counts as a break.
+    breaks = sum(1 for prev, cur in zip(labels, labels[1:]) if prev and not cur)
+    summary = {
+        "frames_read": frames,
+        "frames_with_person": len(ratios),
+        "good_fraction": round(sum(labels) / len(labels), 3),
+        "breaks": breaks,
+    }
+    with open(args.out, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(json.dumps(summary))
     return EXIT_OK
 
 
